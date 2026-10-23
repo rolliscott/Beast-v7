@@ -1,7 +1,7 @@
-name: Delphian v8.3 BEAST TANK - FREE NO CARD
+name: Delphian v9.0 BEAST TANK - SAVE COIN 6:30-21:30 Lagos
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/10 5-20 * * *'  # Every 10 min, 06:00-21:59 Lagos (covers your 6:30-21:30)
   workflow_dispatch:
 jobs:
   trade:
@@ -18,6 +18,12 @@ jobs:
       - run: |
           git config user.email "bot@beast.tank"
           git config user.name "Beast Tank Bot"
-          git add status.json candles.json || true
-          git diff --quiet && git diff --staged --quiet || git commit -m "update status"
-          git push
+          # SAVE COIN: Push only when GHOST signal
+          if grep -q "GHOST SHORT\|GHOST LONG" status.json; then
+            echo "🚨 GHOST FOUND - PUSHING"
+            git add status.json candles.json || true
+            git diff --quiet && git diff --staged --quiet || git commit -m "🚨 GHOST $(date) - save coin"
+            git push
+          else
+            echo "💤 WAIT 0% - NO PUSH - SAVE COIN 6:30-21:30"
+          fi
