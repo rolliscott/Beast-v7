@@ -1,146 +1,183 @@
 import json, time, requests
-from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 
-# === MERGED CONFIG V8.3 + V5.3 ===
-SYMBOL = "XAUUSD"
-LOOKBACK = 20
-TOUCH_PERC = 0.5  # your V5.3 50% invasion
-EXPIRY_SEC = 300  # 5 min expiry (GitHub cron)
+CLOUD_FILE = "status.json"
+atrLen = 14
+atrSlopeLen = 14
+expansionThreshold = 0.8
+contractionThreshold = 0.8
+wickPercent = 80
+sweepLen = 20
+sweepAtrMult = 0.2
 
-# Load history
-try:
-    with open("candles.json","r") as f:
-        hist=json.load(f)
-        candles=deque(hist.get("candles",[]), maxlen=100)
-        ticks_buffer=deque(hist.get("ticks",[]), maxlen=100)
-        active_sweep=hist.get("active_sweep",{"type":None,"fifty":0,"ignition_vol":0,"time":0})
-        bal=hist.get("bal",10000)
-        pos=hist.get("pos",[])
-        bullets=hist.get("bullets",0)
-except:
-    candles=deque(maxlen=100); ticks_buffer=deque(maxlen=100)
-    active_sweep={"type":None,"fifty":0,"ignition_vol":0,"time":0}
-    bal=10000; pos=[]; bullets=0
-
-def get_xau():
+def get_ohlc(symbol="GC=F", interval="5m", range_="5d"):
     try:
-        r=requests.get("https://api.gold-api.com/price/XAU",timeout=10).json()
-        return float(r['price'])
-    except: return 4027.5
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range_}"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15).json()
+        res = r["chart"]["result"][0]
+        o = res["indicators"]["quote"][0]["open"]
+        h = res["indicators"]["quote"][0]["high"]
+        l = res["indicators"]["quote"][0]["low"]
+        c = res["indicators"]["quote"][0]["close"]
+        data=[]
+        for i in range(len(c)):
+            if c[i] is None: continue
+            data.append({"open":o[i] or c[i],"high":h[i] or c[i],"low":l[i] or c[i],"close":c[i]})
+        return data
+    except: return []
 
-def avg_vol():
-    if len(ticks_buffer)<20: return 1
-    return sum(ticks_buffer)/len(ticks_buffer)
+def calc_atr(data, length=14):
+    if len(data) < length+1: return 1.5, []
+    trs=[]
+    for i in range(1,len(data)):
+        hl=data[i]["high"]-data[i]["low"]
+        hc=abs(data[i]["high"]-data[i-1]["close"])
+        lc=abs(data[i]["low"]-data[i-1]["close"])
+        trs.append(max(hl,hc,lc))
+    atrs=[]
+    atr=sum(trs[:length])/length
+    atrs.append(atr)
+    for tr in trs[length:]:
+        atr=(atr*(length-1)+tr)/length
+        atrs.append(atr)
+    return atrs[-1] if atrs else 1.5, atrs
 
-# === POLL XAU (simulating OnTick) ===
-xau=get_xau()
-candles.append(xau)
-ticks_buffer.append(1)  # each cron = 1 tick bucket, builds real volume
+def calc_slope(atrs, lookback=14):
+    if len(atrs) < lookback+1: return 0
+    now=atrs[-1]
+    prev=atrs[-lookback-1]
+    if prev==0: return 0
+    return (now-prev)/prev*100
 
-if len(candles) < LOOKBACK+2:
-    status={"xau":xau,"htf_regime":"BUILDING","htf_sweep":"NO SWEEP","signal":"WAIT","bal":bal,"pos":pos,"last_check":str(datetime.now())}
-else:
-    recent_low=min(list(candles)[-LOOKBACK-1:-1])
-    recent_high=max(list(candles)[-LOOKBACK-1:-1])
-    curr_high=max(list(candles)[-2:])
-    curr_low=min(list(candles)[-2:])
+def detect_sweeps(ltf_data, htf_high, htf_low, atr):
+    if not ltf_data: return False, False
+    last=ltf_data[-1]
+    isBSL = last["high"] > htf_high + atr*0.2 and last["close"] < htf_high
+    isSSL = last["low"] < htf_low - atr*0.2 and last["close"] > htf_low
+    return isBSL, isSSL
 
-    is_bear_sweep=curr_high>recent_high
-    is_bull_sweep=curr_low<recent_low
+def main():
+    print("DELPHIAN V8.4 CORRECTED - SELL HILL / BUY VALLEY (INVERTED FIX)")
+    ltf = get_ohlc("GC=F","5m","5d")
+    htf_data = get_ohlc("GC=F","60m","5d")
+    if not ltf or not htf_data:
+        ltf=[{"open":4027,"high":4030,"low":4025,"close":4027}]*50
+        htf_data=[{"open":4027,"high":4050,"low":4000,"close":4027}]*50
 
-    avg=avg_vol()
-    ignition_vol=ticks_buffer[-2] if len(ticks_buffer)>2 else avg
-    confirmation_vol=ticks_buffer[-1] if len(ticks_buffer)>1 else avg
+    ltf_atr, ltf_series = calc_atr(ltf, atrLen)
+    htf_atr, htf_series = calc_atr(htf_data, atrLen)
+    ltf_slope = calc_slope(ltf_series, atrSlopeLen)
+    htf_slope = calc_slope(htf_series, atrSlopeLen)
 
-    # === V5.3 CAPTURE SWEEP (YOUR LOGIC) ===
-    if is_bear_sweep and active_sweep["type"] is None:
-        sweep_low=min(list(candles)[-5:])
-        fifty=curr_high - (curr_high - sweep_low)*TOUCH_PERC
-        active_sweep={"type":"BEAR","fifty":fifty,"ignition_vol":ignition_vol,"time":time.time()}
-        print(f"SWEEP CAPTURED: BEAR High {curr_high:.2f} Fifty {fifty:.2f} Vol {ignition_vol}")
+    isHTF_Expansion = htf_slope > expansionThreshold  # HTF HILL - BULL
+    isHTF_Contraction = htf_slope < -contractionThreshold  # HTF VALLEY - BEAR/BASE
+    isLTF_ExpansionHill = ltf_slope > expansionThreshold  # LTF HILL
+    isLTF_ContractionValley = ltf_slope < -contractionThreshold  # LTF VALLEY
 
-    if is_bull_sweep and active_sweep["type"] is None:
-        sweep_high=max(list(candles)[-5:])
-        fifty=curr_low + (sweep_high - curr_low)*TOUCH_PERC
-        active_sweep={"type":"BULL","fifty":fifty,"ignition_vol":ignition_vol,"time":time.time()}
-        print(f"SWEEP CAPTURED: BULL Low {curr_low:.2f} Fifty {fifty:.2f} Vol {ignition_vol}")
+    htf_high = max([d["high"] for d in htf_data[-sweepLen:]])
+    htf_low = min([d["low"] for d in htf_data[-sweepLen:]])
+    isBSL_Now, isSSL_Now = detect_sweeps(ltf, htf_high, htf_low, ltf_atr)
 
-    # === V5.3 WAIT FOR 50% INVASION TOUCH ===
-    signal="BALANCE RANDOM"
-    ghost_confirmed=False
+    # Bump Law - Higher High -> Lower High (Hill exhaustion) | Lower Low -> Higher Low (Valley exhaustion)
+    hh_lh = 0
+    ll_hl = 0
+    for i in range(1, len(ltf_series)-3):
+        if ltf_series[i] > ltf_series[i-1] and ltf_series[i] > ltf_series[i+1]:
+            hh_lh += 1
+        if ltf_series[i] < ltf_series[i-1] and ltf_series[i] < ltf_series[i+1]:
+            ll_hl += 1
+    hh_lh = min(hh_lh,5)
+    ll_hl = min(ll_hl,5)
 
-    if active_sweep["type"]=="BEAR":
-        fifty=active_sweep["fifty"]
-        high_vol=active_sweep["ignition_vol"]>avg*1.5
-        # Touch invasion = price bounces to 50% then rejects
-        touch_invasion = (xau>=fifty*0.998 and xau < fifty*1.002) or (max(list(candles)[-3:])>=fifty and xau < fifty)
-        
-        if touch_invasion:
-            if high_vol and confirmation_vol < avg:
-                signal="🔴 GHOST SHORT - 50% INVASION"
-                ghost_confirmed=True
-                print(f"GHOST SHORT - Level {fifty:.2f} Price {xau:.2f} Ignition HIGH({active_sweep['ignition_vol']}) -> Confirm LOW({confirmation_vol})")
-            elif confirmation_vol > avg*1.2:
-                print(f"STATE B SKIP - trend running, invasion trap avoided")
-                active_sweep={"type":None,"fifty":0,"ignition_vol":0,"time":0}
+    # === CORRECTED LOGIC PER YOUR NOTE ===
+    
+    # SELL FROM HILL: HTF VALLEY (Contraction LL) + LTF HILL (Expansion HH+LH bumps)
+    # ATR: Higher High -> Lower High (second bump LH) = exhaustion of LTF up move
+    # Mean reversion short aligns with 1H Valley bias
+    hill_exhaustion = hh_lh >= 2  # HH then LH
+    sell_hill_condition = isHTF_Contraction and isLTF_ExpansionHill and hill_exhaustion
 
-    if active_sweep["type"]=="BULL":
-        fifty=active_sweep["fifty"]
-        high_vol=active_sweep["ignition_vol"]>avg*1.5
-        touch_invasion = (xau<=fifty*1.002 and xau > fifty*0.998) or (min(list(candles)[-3:])<=fifty and xau > fifty)
-        if touch_invasion:
-            if high_vol and confirmation_vol < avg:
-                signal="🟢 GHOST LONG - 50% INVASION"
-                ghost_confirmed=True
+    # BUY FROM VALLEY: HTF HILL (Expansion HH) + LTF VALLEY (Contraction LL+HL bumps)
+    # ATR: Lower Low -> Higher Low (second bump HL) = exhaustion down, trend resuming, war over, HTF regains
+    valley_exhaustion = ll_hl >= 2  # LL then HL
+    buy_valley_condition = isHTF_Expansion and isLTF_ContractionValley and valley_exhaustion
 
-    # Expire after 5 min if no touch (GitHub cron)
-    if active_sweep["type"] and time.time()-active_sweep["time"]>EXPIRY_SEC:
-        active_sweep={"type":None,"fifty":0,"ignition_vol":0,"time":0}
+    lowestLow = min([d["low"] for d in ltf[-20:]])
+    highestHigh = max([d["high"] for d in ltf[-20:]])
+    last = ltf[-1]
+    body = abs(last["close"]-last["open"])
+    upperWick = last["high"] - max(last["open"], last["close"])
+    lowerWick = min(last["open"], last["close"]) - last["low"]
+    isFreshValley = last["low"] == lowestLow and lowerWick > body*(wickPercent/100) and isLTF_ContractionValley
+    isStaleHill = last["high"] == highestHigh and upperWick > body*(wickPercent/100) and isLTF_ExpansionHill
 
-    # === DELPHIAN MERGE: bullets + TP/SL ===
-    if ghost_confirmed and bullets<2 and not pos:
-        if "SHORT" in signal:
-            pos.append({"pair":SYMBOL,"type":"SELL","entry":xau,"sl":xau+5,"tp":xau-8,"fifty":fifty})
+    ny = datetime.now().hour >= 9  # simplified NY filter
+
+    # FINAL - CORRECTED
+    finalSell = sell_hill_condition and isStaleHill and isBSL_Now and ny  # Sell from Hill top
+    finalBuy = buy_valley_condition and isFreshValley and isSSL_Now and ny  # Buy from Valley bottom
+
+    xau_price = last["close"]
+    try:
+        r = requests.get("https://api.gold-api.com/price/XAU", timeout=10).json()
+        if r.get("price"): xau_price = float(r["price"])
+    except: pass
+    try:
+        rN = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5ENDX?interval=1m&range=1d", timeout=10).json()
+        nas_price = rN["chart"]["result"][0]["meta"]["regularMarketPrice"]
+    except:
+        nas_price = 28950
+
+    fifty = round(xau_price/50)*50
+
+    if finalSell:
+        ghost="GHOST SHORT"
+        pattern="SELL FROM HILL - HTF VALLEY + LTF HILL EXHAUSTION HH->LH"
+        invasion=75 if hh_lh>=2 else 50
+    elif finalBuy:
+        ghost="GHOST LONG"
+        pattern="BUY FROM VALLEY - HTF HILL + LTF VALLEY EXHAUSTION LL->HL WAR OVER"
+        invasion=75 if ll_hl>=2 else 50
+    else:
+        ghost="WAIT"
+        if sell_hill_condition and not isBSL_Now:
+            pattern=f"HTF VALLEY + LTF HILL READY - WAITING BSL SWEEP | HH_LH {hh_lh}"
+            invasion=25
+        elif buy_valley_condition and not isSSL_Now:
+            pattern=f"HTF HILL + LTF VALLEY READY - WAITING SSL SWEEP | LL_HL {ll_hl}"
+            invasion=25
         else:
-            pos.append({"pair":SYMBOL,"type":"BUY","entry":xau,"sl":xau-5,"tp":xau+8,"fifty":fifty})
-        bullets+=1
-        active_sweep={"type":None,"fifty":0,"ignition_vol":0,"time":0}
-
-    # Check TP/SL
-    new_pos=[]
-    for p in pos:
-        hit=False
-        if p['type']=='SELL' and (xau<=p['tp'] or xau>=p['sl']): hit=True
-        if p['type']=='BUY' and (xau>=p['tp'] or xau<=p['sl']): hit=True
-        if hit:
-            pnl=(p['entry']-xau)*90 if p['type']=='SELL' else (xau-p['entry'])*90
-            bal+=pnl
-        else: new_pos.append(p)
-    pos=new_pos
+            pattern="BALANCE - NO HTF/LTF MISALIGNMENT"
+            invasion=0
 
     status={
-        "xau":xau,
-        "htf_regime":f"AVG VOL {avg:.1f} | IGN {ignition_vol} CONF {confirmation_vol}",
-        "htf_sweep": f"{active_sweep['type']} SWEEP Fifty {active_sweep['fifty']:.2f}" if active_sweep["type"] else "NO SWEEP - STAY OUT",
-        "breath": "BEAR INVASION" if active_sweep["type"]=="BEAR" else "BULL INVASION" if active_sweep["type"]=="BULL" else "NONE",
-        "bumps_hh_lh":0,
-        "bumps_ll_hl":0,
-        "valley_top": "TOUCH WAIT" if active_sweep["type"] else "EXPIRED" if signal=="BALANCE RANDOM" else "CONFIRMED",
-        "atr_ltf":f"{TOUCH_PERC*100}% INVASION",
-        "atr_htf":f"IGN {active_sweep['ignition_vol']}>AVG*1.5 ? {active_sweep['ignition_vol']>avg*1.5}",
-        "bullets":f"{bullets}/2",
-        "signal":signal,
-        "bal":round(bal,2),
-        "pos":pos,
-        "server":"BEAST V5.3 INVASION + V8.3 FREE",
-        "last_check":str(datetime.now()),
-        "ny":True,
-        "fifty":active_sweep["fifty"]
+        "invasion_pct": invasion,
+        "ghost_signal": ghost,
+        "fifty_level": fifty,
+        "signal": ghost,
+        "pattern": pattern,
+        "htf_regime": "VALLEY CONTRACTION LL - SELL BIAS" if isHTF_Contraction else "HILL EXPANSION HH - BUY BIAS" if isHTF_Expansion else "BALANCE",
+        "ltf_breath": "HILL EXPANSION - EXHAUSTION SHORT SETUP" if isLTF_ExpansionHill else "VALLEY CONTRACTION - EXHAUSTION LONG SETUP" if isLTF_ContractionValley else "BALANCE",
+        "htf_sweep": "BSL SWEPT - SELL READY" if isBSL_Now else "SSL SWEPT - BUY READY" if isSSL_Now else "NO SWEEP",
+        "hh_lh_count": hh_lh,
+        "ll_hl_count": ll_hl,
+        "atr_ltf": round(ltf_slope,2),
+        "atr_htf": round(htf_slope,2),
+        "price": xau_price,
+        "xau_price": xau_price,
+        "nas_price": nas_price,
+        "last_update": datetime.now().strftime("%H:%M:%S"),
+        "timestamp": int(time.time()),
+        "version": "V8.4 CORRECTED SELL HILL / BUY VALLEY",
+        "logic": "SELL: HTF VALLEY + LTF HILL HH->LH exhaustion | BUY: HTF HILL + LTF VALLEY LL->HL war over"
     }
 
-# SAVE FOR V6 APP TRACKING
-with open("status.json","w") as f: json.dump(status,f,indent=2)
-with open("candles.json","w") as f: json.dump({"candles":list(candles),"ticks":list(ticks_buffer),"active_sweep":active_sweep,"bal":bal,"pos":pos,"bullets":bullets},f)
+    with open(CLOUD_FILE,"w") as f:
+        json.dump(status,f,indent=2)
 
-print(json.dumps(status,indent=2))
+    print(f"✅ {pattern}")
+    print(f"   GHOST: {ghost} {invasion}% | {status['htf_regime']} | {status['ltf_breath']} | Bumps HH_LH {hh_lh} LL_HL {ll_hl} | XAU {xau_price}")
+    print(json.dumps(status,indent=2))
+
+if __name__=="__main__":
+    main()
