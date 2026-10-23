@@ -6,9 +6,8 @@ atrLen = 14
 atrSlopeLen = 14
 expansionThreshold = 0.8
 contractionThreshold = 0.8
-wickPercent = 80
+wickPercent = 40
 sweepLen = 20
-sweepAtrMult = 0.2
 
 def get_ohlc(symbol="GC=F", interval="5m", range_="5d"):
     try:
@@ -26,8 +25,8 @@ def get_ohlc(symbol="GC=F", interval="5m", range_="5d"):
         return data
     except: return []
 
-def calc_atr(data, length=14):
-    if len(data) < length+1: return 1.5, []
+def calc_atr_series(data, length=14):
+    if len(data) < length+2: return [1.5], 1.5
     trs=[]
     for i in range(1,len(data)):
         hl=data[i]["high"]-data[i]["low"]
@@ -40,7 +39,7 @@ def calc_atr(data, length=14):
     for tr in trs[length:]:
         atr=(atr*(length-1)+tr)/length
         atrs.append(atr)
-    return atrs[-1] if atrs else 1.5, atrs
+    return atrs, atrs[-1] if atrs else 1.5
 
 def calc_slope(atrs, lookback=14):
     if len(atrs) < lookback+1: return 0
@@ -49,74 +48,62 @@ def calc_slope(atrs, lookback=14):
     if prev==0: return 0
     return (now-prev)/prev*100
 
-def detect_sweeps(ltf_data, htf_high, htf_low, atr):
-    if not ltf_data: return False, False
-    last=ltf_data[-1]
-    isBSL = last["high"] > htf_high + atr*0.2 and last["close"] < htf_high
-    isSSL = last["low"] < htf_low - atr*0.2 and last["close"] > htf_low
-    return isBSL, isSSL
-
 def main():
-    print("DELPHIAN V8.4 CORRECTED - SELL HILL / BUY VALLEY (INVERTED FIX)")
-    ltf = get_ohlc("GC=F","5m","5d")
+    print("DELPHIAN V8.7 FINAL - HTF ONLY BIAS, ALL SWEEP/ENTRY LTF 5M")
+    # HTF ONLY FOR BIAS - 60m
     htf_data = get_ohlc("GC=F","60m","5d")
-    if not ltf or not htf_data:
+    # LTF 5M - FOR EVERYTHING: Sweep, Bumps, Entry, TP
+    ltf = get_ohlc("GC=F","5m","5d")
+
+    if len(ltf) < 30 or len(htf_data) < 30:
+        print("No data")
         ltf=[{"open":4027,"high":4030,"low":4025,"close":4027}]*50
         htf_data=[{"open":4027,"high":4050,"low":4000,"close":4027}]*50
 
-    ltf_atr, ltf_series = calc_atr(ltf, atrLen)
-    htf_atr, htf_series = calc_atr(htf_data, atrLen)
+    ltf_series, ltf_atr = calc_atr_series(ltf, atrLen)
+    htf_series, htf_atr = calc_atr_series(htf_data, atrLen)
     ltf_slope = calc_slope(ltf_series, atrSlopeLen)
     htf_slope = calc_slope(htf_series, atrSlopeLen)
 
-    isHTF_Expansion = htf_slope > expansionThreshold  # HTF HILL - BULL
-    isHTF_Contraction = htf_slope < -contractionThreshold  # HTF VALLEY - BEAR/BASE
-    isLTF_ExpansionHill = ltf_slope > expansionThreshold  # LTF HILL
-    isLTF_ContractionValley = ltf_slope < -contractionThreshold  # LTF VALLEY
+    # === HTF ONLY BIAS CHECK ===
+    isHTF_HILL = htf_slope > expansionThreshold  # HTF HILL Expansion HH = BUY BIAS
+    isHTF_VALLEY = htf_slope < -contractionThreshold  # HTF VALLEY Contraction LL = SELL BIAS
+    # LTF BREATH
+    isLTF_HILL = ltf_slope > expansionThreshold
+    isLTF_VALLEY = ltf_slope < -contractionThreshold
 
-    htf_high = max([d["high"] for d in htf_data[-sweepLen:]])
-    htf_low = min([d["low"] for d in htf_data[-sweepLen:]])
-    isBSL_Now, isSSL_Now = detect_sweeps(ltf, htf_high, htf_low, ltf_atr)
+    # === LTF 5M ONLY - SWEEP LEVELS (Liquidity) ===
+    # Previous 20 bars of LTF 5m only
+    prevHigh_LTF = max([d["high"] for d in ltf[-sweepLen-1:-1]])  # BSL - Sell side liquidity - resistance - LTF 5m
+    prevLow_LTF = min([d["low"] for d in ltf[-sweepLen-1:-1]])   # SSL - Buy side liquidity - support - LTF 5m
+    balance_LTF = (prevHigh_LTF + prevLow_LTF) / 2  # Balance / 50% TP - LTF 5m
+    last = ltf[-1]
 
-    # Bump Law - Higher High -> Lower High (Hill exhaustion) | Lower Low -> Higher Low (Valley exhaustion)
+    # LTF 5M SWEEP - Real liquidity sweep
+    isBSL_Sweep_LTF = last["high"] > prevHigh_LTF and last["close"] < prevHigh_LTF  # LTF 5m swept BSL
+    isSSL_Sweep_LTF = last["low"] < prevLow_LTF and last["close"] > prevLow_LTF  # LTF 5m swept SSL
+
+    # LTF 5M BUMP LAW
     hh_lh = 0
     ll_hl = 0
-    for i in range(1, len(ltf_series)-3):
-        if ltf_series[i] > ltf_series[i-1] and ltf_series[i] > ltf_series[i+1]:
+    for i in range(2, len(ltf_series)-2):
+        if ltf_series[i] > ltf_series[i-1] and ltf_series[i] > ltf_series[i-2] and ltf_series[i] > ltf_series[i+1] and ltf_series[i] > ltf_series[i+2]:
             hh_lh += 1
-        if ltf_series[i] < ltf_series[i-1] and ltf_series[i] < ltf_series[i+1]:
+        if ltf_series[i] < ltf_series[i-1] and ltf_series[i] < ltf_series[i-2] and ltf_series[i] < ltf_series[i+1] and ltf_series[i] < ltf_series[i+2]:
             ll_hl += 1
-    hh_lh = min(hh_lh,5)
-    ll_hl = min(ll_hl,5)
+    hh_lh = min(hh_lh, 10)
+    ll_hl = min(ll_hl, 10)
 
-    # === CORRECTED LOGIC PER YOUR NOTE ===
-    
-    # SELL FROM HILL: HTF VALLEY (Contraction LL) + LTF HILL (Expansion HH+LH bumps)
-    # ATR: Higher High -> Lower High (second bump LH) = exhaustion of LTF up move
-    # Mean reversion short aligns with 1H Valley bias
-    hill_exhaustion = hh_lh >= 2  # HH then LH
-    sell_hill_condition = isHTF_Contraction and isLTF_ExpansionHill and hill_exhaustion
+    hill_exhaustion_LTF = hh_lh >= 2  # HH -> LH LTF 5m
+    valley_exhaustion_LTF = ll_hl >= 2  # LL -> HL LTF 5m
 
-    # BUY FROM VALLEY: HTF HILL (Expansion HH) + LTF VALLEY (Contraction LL+HL bumps)
-    # ATR: Lower Low -> Higher Low (second bump HL) = exhaustion down, trend resuming, war over, HTF regains
-    valley_exhaustion = ll_hl >= 2  # LL then HL
-    buy_valley_condition = isHTF_Expansion and isLTF_ContractionValley and valley_exhaustion
+    # === FINAL - HTF BIAS + LTF EXECUTION ===
+    # SELL HILL: HTF bias VALLEY + LTF 5m HILL + BSL sweep LTF 5m + HH->LH bumps LTF 5m -> Ride to Balance
+    sell_hill_LTF = isHTF_VALLEY and isLTF_HILL and hill_exhaustion_LTF and isBSL_Sweep_LTF
+    # BUY VALLEY: HTF bias HILL + LTF 5m VALLEY + SSL sweep LTF 5m + LL->HL bumps LTF 5m -> Ride to Balance, war over
+    buy_valley_LTF = isHTF_HILL and isLTF_VALLEY and valley_exhaustion_LTF and isSSL_Sweep_LTF
 
-    lowestLow = min([d["low"] for d in ltf[-20:]])
-    highestHigh = max([d["high"] for d in ltf[-20:]])
-    last = ltf[-1]
-    body = abs(last["close"]-last["open"])
-    upperWick = last["high"] - max(last["open"], last["close"])
-    lowerWick = min(last["open"], last["close"]) - last["low"]
-    isFreshValley = last["low"] == lowestLow and lowerWick > body*(wickPercent/100) and isLTF_ContractionValley
-    isStaleHill = last["high"] == highestHigh and upperWick > body*(wickPercent/100) and isLTF_ExpansionHill
-
-    ny = datetime.now().hour >= 9  # simplified NY filter
-
-    # FINAL - CORRECTED
-    finalSell = sell_hill_condition and isStaleHill and isBSL_Now and ny  # Sell from Hill top
-    finalBuy = buy_valley_condition and isFreshValley and isSSL_Now and ny  # Buy from Valley bottom
-
+    # Real live prices for app
     xau_price = last["close"]
     try:
         r = requests.get("https://api.gold-api.com/price/XAU", timeout=10).json()
@@ -130,35 +117,40 @@ def main():
 
     fifty = round(xau_price/50)*50
 
-    if finalSell:
+    if sell_hill_LTF:
         ghost="GHOST SHORT"
-        pattern="SELL FROM HILL - HTF VALLEY + LTF HILL EXHAUSTION HH->LH"
-        invasion=75 if hh_lh>=2 else 50
-    elif finalBuy:
+        pattern=f"SELL HILL LTF 5M - HTF BIAS VALLEY + BSL {prevHigh_LTF:.2f} swept LTF + HH->LH {hh_lh} -> TP Balance {balance_LTF:.2f}"
+        invasion=75
+    elif buy_valley_LTF:
         ghost="GHOST LONG"
-        pattern="BUY FROM VALLEY - HTF HILL + LTF VALLEY EXHAUSTION LL->HL WAR OVER"
-        invasion=75 if ll_hl>=2 else 50
+        pattern=f"BUY VALLEY LTF 5M - HTF BIAS HILL + SSL {prevLow_LTF:.2f} swept LTF + LL->HL {ll_hl} WAR OVER -> TP Balance {balance_LTF:.2f}"
+        invasion=75
+    elif isHTF_VALLEY and isLTF_HILL and hill_exhaustion_LTF:
+        ghost="WAIT"
+        pattern=f"HTF VALLEY BIAS + LTF HILL HH->LH {hh_lh} READY LTF - WAITING BSL SWEEP LTF {prevHigh_LTF:.2f}"
+        invasion=50
+    elif isHTF_HILL and isLTF_VALLEY and valley_exhaustion_LTF:
+        ghost="WAIT"
+        pattern=f"HTF HILL BIAS + LTF VALLEY LL->HL {ll_hl} READY LTF - WAITING SSL SWEEP LTF {prevLow_LTF:.2f}"
+        invasion=50
     else:
         ghost="WAIT"
-        if sell_hill_condition and not isBSL_Now:
-            pattern=f"HTF VALLEY + LTF HILL READY - WAITING BSL SWEEP | HH_LH {hh_lh}"
-            invasion=25
-        elif buy_valley_condition and not isSSL_Now:
-            pattern=f"HTF HILL + LTF VALLEY READY - WAITING SSL SWEEP | LL_HL {ll_hl}"
-            invasion=25
-        else:
-            pattern="BALANCE - NO HTF/LTF MISALIGNMENT"
-            invasion=0
+        pattern=f"BALANCE LTF - HTF {htf_slope:.1f}% LTF {ltf_slope:.1f}% | BSL LTF {prevHigh_LTF:.2f} SSL LTF {prevLow_LTF:.2f} Balance LTF {balance_LTF:.2f}"
+        invasion=0
 
     status={
         "invasion_pct": invasion,
         "ghost_signal": ghost,
         "fifty_level": fifty,
+        "balance_price": round(balance_LTF,2),
+        "bsl_liquidity": round(prevHigh_LTF,2),
+        "ssl_liquidity": round(prevLow_LTF,2),
         "signal": ghost,
         "pattern": pattern,
-        "htf_regime": "VALLEY CONTRACTION LL - SELL BIAS" if isHTF_Contraction else "HILL EXPANSION HH - BUY BIAS" if isHTF_Expansion else "BALANCE",
-        "ltf_breath": "HILL EXPANSION - EXHAUSTION SHORT SETUP" if isLTF_ExpansionHill else "VALLEY CONTRACTION - EXHAUSTION LONG SETUP" if isLTF_ContractionValley else "BALANCE",
-        "htf_sweep": "BSL SWEPT - SELL READY" if isBSL_Now else "SSL SWEPT - BUY READY" if isSSL_Now else "NO SWEEP",
+        "htf_regime": "VALLEY LL - SELL BIAS (HTF ONLY BIAS)" if isHTF_VALLEY else "HILL HH - BUY BIAS (HTF ONLY BIAS)" if isHTF_HILL else "BALANCE",
+        "ltf_breath": f"HILL HH->LH {hh_lh} LTF 5M" if isLTF_HILL else f"VALLEY LL->HL {ll_hl} LTF 5M WAR OVER" if isLTF_VALLEY else "BALANCE LTF",
+        "htf_sweep": "HTF ONLY BIAS - NO SWEEP",
+        "ltf_sweep": f"BSL SWEPT LTF {prevHigh_LTF:.2f}" if isBSL_Sweep_LTF else f"SSL SWEPT LTF {prevLow_LTF:.2f}" if isSSL_Sweep_LTF else f"NO SWEEP LTF - BSL {prevHigh_LTF:.2f} SSL {prevLow_LTF:.2f}",
         "hh_lh_count": hh_lh,
         "ll_hl_count": ll_hl,
         "atr_ltf": round(ltf_slope,2),
@@ -166,18 +158,19 @@ def main():
         "price": xau_price,
         "xau_price": xau_price,
         "nas_price": nas_price,
+        "tp_target": round(balance_LTF,2),
+        "execution": "ALL LTF 5M - Sweep + Entry + TP Balance/Fifty | HTF ONLY BIAS",
         "last_update": datetime.now().strftime("%H:%M:%S"),
         "timestamp": int(time.time()),
-        "version": "V8.4 CORRECTED SELL HILL / BUY VALLEY",
-        "logic": "SELL: HTF VALLEY + LTF HILL HH->LH exhaustion | BUY: HTF HILL + LTF VALLEY LL->HL war over"
+        "version": "V8.7 FINAL HTF BIAS ONLY LTF 5M EXECUTION",
+        "logic": "HTF ONLY BIAS | LTF 5M: Sweep BSL/SSL liquidity + HH->LH/LL->HL bumps + Ride to Balance/Fifty"
     }
 
     with open(CLOUD_FILE,"w") as f:
         json.dump(status,f,indent=2)
 
     print(f"✅ {pattern}")
-    print(f"   GHOST: {ghost} {invasion}% | {status['htf_regime']} | {status['ltf_breath']} | Bumps HH_LH {hh_lh} LL_HL {ll_hl} | XAU {xau_price}")
-    print(json.dumps(status,indent=2))
+    print(f"   HTF BIAS ONLY: {status['htf_regime']} | LTF 5M EXECUTION: {status['ltf_breath']} | BSL LTF {prevHigh_LTF:.2f} SSL LTF {prevLow_LTF:.2f} Balance LTF {balance_LTF:.2f} | GHOST {ghost} {invasion}% | XAU {xau_price}")
 
 if __name__=="__main__":
     main()
